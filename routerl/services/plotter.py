@@ -58,6 +58,7 @@ class Plotter:
         self.colors = []
 
         self.params = params
+        self.plot_choices = params[kc.PLOT_CHOICES]
         self.phases = params[kc.PHASES]
         self.phase_names = params[kc.PHASE_NAMES]
         self.smooth_by = params[kc.SMOOTH_BY]
@@ -88,13 +89,20 @@ class Plotter:
         """
 
         self.saved_episodes = self._get_episodes()
-        self.visualize_mean_rewards()
-        self.visualize_mean_travel_times()
-        self.visualize_tt_distributions()
-        self.visualize_actions()
-        self.visualize_action_shifts()
-        self.visualize_sim_length()
-        self.visualize_losses()
+        
+        if self.plot_choices == kc.PLOT_ALL:
+            self.visualize_mean_rewards()
+            self.visualize_mean_travel_times()
+            self.visualize_tt_distributions()
+            self.visualize_actions()
+            self.visualize_action_shifts()
+            self.visualize_sim_length()
+            self.visualize_losses()
+        elif self.plot_choices == kc.PLOT_BASIC:
+            self.visualize_mean_rewards()
+            self.visualize_mean_travel_times()
+        elif self.plot_choices != kc.PLOT_NONE:
+            logging.warning(f"Plot choice mode {self.plot_choices} is not recognised. Options: {kc.PLOT_ALL}, {kc.PLOT_BASIC}, {kc.PLOT_NONE}")
 
     def _get_episodes(self) -> list[int]:
         """Get the episodes data
@@ -270,60 +278,66 @@ class Plotter:
         axes[1].set_title('Variance Travel Times', fontsize=self.title_size, fontweight='bold')
         axes[1].legend()
 
-        # Plot boxplot and violin plot for rewards
-        all_travel_times = self._retrieve_data_per_kind(kc.TRAVEL_TIME)
-        eps_to_plot = [ep-1 for ep in self.phases[1:]] + [self.saved_episodes[-1]]
-        data_to_plot = [all_travel_times[kc.TYPE_HUMAN][ep] for ep in eps_to_plot]
-        labels = [f'Humans\n({ph})' for ph in self.phase_names]
+        if len(self.phases) > 1:
+            # Plot boxplot and violin plot for rewards
+            all_travel_times = self._retrieve_data_per_kind(kc.TRAVEL_TIME)
+            eps_to_plot = list()
+            for phase in self.phases[1:]:
+                eps_before = [ep for ep in self.saved_episodes if ep < phase]
+                eps_to_plot.append(max(eps_before))
+            eps_to_plot.append(self.saved_episodes[-1])
+            data_to_plot = [all_travel_times[kc.TYPE_HUMAN][ep] for ep in eps_to_plot]
+            
+            if data_to_plot:
+                labels = [f'Humans\n({ph})' for ph in self.phase_names]
+                bplot = axes[2].boxplot(data_to_plot, labels=labels, patch_artist=True)
+                for idx, (patch, med) in enumerate(zip(bplot['boxes'], bplot['medians'])):
+                    color = self.colors[idx]
+                    patch.set_facecolor(color)
+                    med.set_color('black')
+                    med.set_linewidth(2)
+                axes[2].tick_params(axis='both', which='major', labelsize=self.tick_label_size)
+                axes[2].grid(axis = 'y')
+                axes[2].set_ylabel('Travel Times', fontsize=self.label_size)
+                axes[2].set_title(f'Human T.T. Distributions (End of Phases)', fontsize=self.title_size, fontweight='bold')
 
-        bplot = axes[2].boxplot(data_to_plot, labels=labels, patch_artist=True)
-        for idx, (patch, med) in enumerate(zip(bplot['boxes'], bplot['medians'])):
-            color = self.colors[idx]
-            patch.set_facecolor(color)
-            med.set_color('black')
-            med.set_linewidth(2)
-        axes[2].tick_params(axis='both', which='major', labelsize=self.tick_label_size)
-        axes[2].grid(axis = 'y')
-        axes[2].set_ylabel('Travel Times', fontsize=self.label_size)
-        axes[2].set_title(f'Human T.T. Distributions (End of Phases)', fontsize=self.title_size, fontweight='bold')
+            dark_gray = '#333333'
+            axes[3].set_facecolor(dark_gray)
+            for idx, (label, data) in enumerate(zip(labels, data_to_plot)):
+                data = np.array(data)
+                data[np.isinf(data)] = np.nan  # Convert inf to NaN
 
-        dark_gray = '#333333'
-        axes[3].set_facecolor(dark_gray)
-        for idx, (label, data) in enumerate(zip(labels, data_to_plot)):
-            data = np.array(data)
-            data[np.isinf(data)] = np.nan  # Convert inf to NaN
-
-            sns.kdeplot(data,
-                        ax=axes[3],
-                        label=label,
-                        alpha=0.8,
-                        fill=True,
-                        linewidth=3,
-                        color=self.colors[idx],
-                        clip=(0, None))
-            median_val, mean_val = np.nanmedian(data), np.nanmean(data)
-            # Plot a vertical line from top to mid-plot for median
-            axes[3].axvline(median_val,
+                sns.kdeplot(data,
+                            ax=axes[3],
+                            label=label,
+                            alpha=0.8,
+                            fill=True,
+                            linewidth=3,
                             color=self.colors[idx],
-                            linestyle='-',
-                            linewidth=2,
-                            ymin=0.5,
-                            ymax=1,
-                            label=f'Median {label}')
-            # Plot a vertical line from bottom to mid-plot for mean
-            axes[3].axvline(mean_val,
-                            color=self.colors[idx],
-                            linestyle='--',
-                            linewidth=2,
-                            ymin=0,
-                            ymax=0.5,
-                            label=f'Mean {label}')
-        axes[3].tick_params(axis='both', which='major', labelsize=self.tick_label_size)
-        axes[3].set_xlim(0, None)
-        axes[3].set_xlabel('Travel Times', fontsize=self.label_size)
-        axes[3].set_ylabel('Probability Density', fontsize=self.label_size)
-        axes[3].set_title(f'Human T.T. Distributions (End of Phases)', fontsize=self.title_size, fontweight='bold')
-        axes[3].legend()
+                            clip=(0, None))
+                median_val, mean_val = np.nanmedian(data), np.nanmean(data)
+                # Plot a vertical line from top to mid-plot for median
+                axes[3].axvline(median_val,
+                                color=self.colors[idx],
+                                linestyle='-',
+                                linewidth=2,
+                                ymin=0.5,
+                                ymax=1,
+                                label=f'Median {label}')
+                # Plot a vertical line from bottom to mid-plot for mean
+                axes[3].axvline(mean_val,
+                                color=self.colors[idx],
+                                linestyle='--',
+                                linewidth=2,
+                                ymin=0,
+                                ymax=0.5,
+                                label=f'Mean {label}')
+            axes[3].tick_params(axis='both', which='major', labelsize=self.tick_label_size)
+            axes[3].set_xlim(0, None)
+            axes[3].set_xlabel('Travel Times', fontsize=self.label_size)
+            axes[3].set_ylabel('Probability Density', fontsize=self.label_size)
+            axes[3].set_title(f'Human T.T. Distributions (End of Phases)', fontsize=self.title_size, fontweight='bold')
+            axes[3].legend()
 
         plt.savefig(save_to)
         plt.close()
@@ -709,7 +723,7 @@ def plotter(params = None):
         logging.warning(f"No parameters provided for plotter, "
                         f"using default parameters. This may result in incorrect plots.")
         curr_dir = os.path.dirname(os.path.realpath(__file__))
-        params_path = os.path.join(curr_dir, f'../environment/{kc.PARAMS_FILE}')
+        params_path = os.path.join(curr_dir, f'../environment/{kc.DEFAULTS_FILE}')
         params = get_params(params_path)
         params = params[kc.PLOTTER]
 

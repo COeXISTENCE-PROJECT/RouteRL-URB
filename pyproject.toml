@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "routerl"
-version = "1.0.1"
-description = "RouteRL is a multi-agent reinforcement learning framework for urban route choice in different city networks."
+name = "routerlurb"
+version = "1.0.0"
+description = "RouteRL is a multi-agent reinforcement learning framework for urban route choice in different city networks. This subpackage is developed to support its compatibility with URB until the full integration."
 authors = [
     { name = "COeXISTENCE", email = "coexistence@uj.edu.pl" }
 ]

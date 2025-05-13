@@ -3,8 +3,10 @@ PettingZoo environment for optimal route choice using SUMO simulator.
 
 """
 
+import glob
 import os
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from copy import deepcopy as dc
 from gymnasium.spaces import Discrete
@@ -14,12 +16,11 @@ import logging
 import numpy as np
 import pandas as pd
 import random
-import threading
 
 from routerl.environment import generate_agents
 from routerl.environment import SumoSimulator
 from routerl.environment import MachineAgent
-from routerl.environment import PreviousAgentStart, PreviousAgentStartPlusStartTime, Observations
+from routerl.environment import PreviousAgentStart, PreviousAgentStartPlusStartTime, PreviousAgentStartPlusStartTimeDetectorData, Observations
 from routerl.keychain import Keychain as kc
 from routerl.services import plotter
 from routerl.services import Recorder
@@ -55,7 +56,7 @@ class TrafficEnvironment(AECEnv):
             Whether to generate paths. Defaults to ``True``.
         **kwargs (dict, optional): 
             User-defined parameter overrides. These override default values 
-            from ``params.json`` and allow experiment configuration.
+            from ``defaults.json`` and allow experiment configuration.
             
 
     Keyword arguments (see the usage below):
@@ -86,41 +87,77 @@ class TrafficEnvironment(AECEnv):
             - human_parameters (**dict**): 
                 Human agent settings.
                 
-                - model (str, default="culo"):
-                    Decision-making model (options: ``gawron``, ``culo``, ``w_avg``).
+                - model (str, default="gawron"):
+                    Decision-making model (options: ``random``, ``gawron``, ``weighted``).
                     
-                - alpha_j (float, default=0.5):
-                    Cost expectation coefficient (0-1 range).
+                - noise_weight_agent (float, default=0.2):
+                    Agent noise weight in the error term composition.
                     
-                - alpha_zero (float, default=0.5):
-                    Sensitivity to new experiences.
+                - noise_weight_path (float, default=0.6):
+                    Path noise weight in the error term composition.
                     
-                - beta (float, default=-1.5):
-                    Decision randomness parameter.
+                - noise_weight_day (float, default=0.2):
+                    Day noise weight in the error term composition.
                     
-                - beta_randomness (float, default=0.1):
-                    Variability in ``beta`` among the human population.
+                - beta (float, default=-1.0):
+                    **Negative value**, multiplier of reward (travel time) used in utility, determines sensitivity.
                     
-                - remember (int, default=3):
-                    Number of past experiences retained.
+                - beta_k_i_variability (float, default=0):
+                    Variance of normal distribution for which ``beta_k_i`` is drawn (computed in utility).
+                    
+                - epsilon_i_variability (float, default=0):
+                    Variance of normal distribution from which error terms are drawn, first term.
+                    
+                - epsilon_k_i_variability (float, default=0):
+                    Variance of normal distribution from which error terms are drawn, second term.
+                    
+                - epsilon_k_i_t_variability (float, default=0):
+                    Variance of normal distribution from which error terms are drawn, third term. These three terms must sum to 1.
+                    
+                - greedy (float, default=1.0):
+                    1 - exploration_rate, probability with which the choice are rational (argmax(U)) and not probabilistic (random).
+                    
+                - gamma_c (float, default=0):
+                    Bounded rationality component. Expressed as relative increase in costs/utilities below which user do not change behaviour (do not notice it).
+                    
+                - gamma_u (float, default=0):
+                    Bounded rationality component. Expressed as relative increase in costs/utilities below which user do not change behaviour (do not notice it).
+                
+                - remember (int, default=1):
+                    Number of days remembered to learn from.
+                    
+                - alpha_zero (float, default=0.2):
+                    Weight with which the recent experience is carried forward in learning.
+                    
+                - alphas (list[float], default=[0.8]):
+                    Vector of weights for historically recorded reward in weighted average, **needs to be size of** ``remember``.
 
         - environment_parameters (dict, optional):
             Environment settings.
             
             - number_of_days (int, default=1):
                 Number of days in the scenario.
+                
+            - save_every (int, default=1):
+                Save the episode data to disk every X days.
 
         - simulator_parameters (dict, optional): 
-            **SUMO simulator settings.**
+            SUMO simulator settings.
             
             - network_name (str, default="csomor"):
-                Network name (e.g., ``arterial``, ``cologne``, ``grid``).
+                Network name (e.g., ``arterial``, ``cologne``, ``grid``)
+                
+            - custom_network_folder (str, default="NA"):
+                In case of custom network, specify the folder name.
             
             - simulation_timesteps (int, default=180):
                 Total simulation time in seconds.
             
             - sumo_type (str, default="sumo"):
                 SUMO execution mode (``sumo`` or ``sumo-gui``).
+                
+            - stuck_time (int, default=600):
+                Number of seconds to tolerate before `teleporting` a stopped vehicle to resolve gridlocks.
 
         - path_generation_parameters (dict, optional):
             Path generation settings.
@@ -142,6 +179,9 @@ class TrafficEnvironment(AECEnv):
                 
             - destinations (str | list[str], default="default"):
                 Destination points from the network. (e.g., ``["-115604057#1", "-279952229#4"]``)
+                
+            - visualize_paths (bool, default=True):
+                Whether to visualize generated paths. Visuals will be saved in the ``plotter_parameters/plots_folder``.
 
         - plotter_parameters (dict, optional): 
             Plotting & logging settings.
@@ -151,6 +191,9 @@ class TrafficEnvironment(AECEnv):
                 
             - plots_folder (str, default="plots"):
                 Directory for plots.
+                
+            - plot_choices (str, default="all"):
+                Selection of plots to be generated. Options: ``none``, ``basic``, ``all``.
                 
             - smooth_by (int, default=50): 
                 Smoothing parameter for plots.
@@ -280,14 +323,15 @@ class TrafficEnvironment(AECEnv):
                  seed: int = 23423,
                  create_agents: bool = True,
                  create_paths: bool = True,
+                 save_detectors_info: bool = False,
                  **kwargs) -> None:
 
         super().__init__()
         self.render_mode = None
 
-        # Read default parameters, update w #TODO kwargs
-        params_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), kc.PARAMS_FILE)
-        params = get_params(params_path, resolve=True, update=kwargs)
+        # Read default parameters, update with kwargs
+        defaults_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), kc.DEFAULTS_FILE)
+        params = get_params(defaults_path, resolve=True, update=kwargs)
 
         self.environment_params = params[kc.ENVIRONMENT]
         self.simulation_params = params[kc.SIMULATOR]
@@ -300,13 +344,15 @@ class TrafficEnvironment(AECEnv):
         self.human_learning = True
         self.machine_same_start_time = []
         self.actions_timestep = []
+        self.save_detectors_info = save_detectors_info
 
         self.number_of_days = self.environment_params[kc.NUMBER_OF_DAYS]
+        self.save_every = self.environment_params[kc.SAVE_EVERY]
         self.action_space_size = self.environment_params[kc.ACTION_SPACE_SIZE]
         self._set_seed(seed)
 
         self.recorder = Recorder(self.plotter_params)
-        self.simulator = SumoSimulator(self.simulation_params, self.path_gen_params, seed)
+        self.simulator = SumoSimulator(self.simulation_params, self.path_gen_params, seed, not create_agents, save_detectors_info)
 
         self.all_agents = generate_agents(self.agent_params, self.get_free_flow_times(), create_agents, seed)
         self.machine_agents = [agent for agent in self.all_agents if agent.kind == kc.TYPE_MACHINE]
@@ -320,6 +366,9 @@ class TrafficEnvironment(AECEnv):
         logging.info(f"There are {len(self.human_agents)} human and {len(self.machine_agents)} machine agents.")
 
         self.episode_actions = dict()
+        
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.pending_futures = []
 
     def __str__(self):
         message = f"TrafficEnvironment with {len(self.all_agents)} agents.\
@@ -347,7 +396,6 @@ class TrafficEnvironment(AECEnv):
 
         ## Initialize the observation object
         self.observation_obj = self.get_observation_function()
-
         self._observation_spaces = self.observation_obj.observation_space()
 
         self._action_spaces = {
@@ -381,8 +429,10 @@ class TrafficEnvironment(AECEnv):
             observations (dict): observations.
             infos (dict): dictionary of information for the agents.
         """
-
         self.episode_actions = dict()
+        self.travel_times_list = list()
+        self.actions_timestep = list()
+        self.machine_same_start_time = list()
         self.simulator.reset()
         self.agents = copy(self.possible_agents)
         self.terminations = {agent: False for agent in self.possible_agents}
@@ -391,7 +441,6 @@ class TrafficEnvironment(AECEnv):
         self.infos = {agent: {} for agent in self.possible_agents}
         self.rewards = {agent: 0 for agent in self.possible_agents}
         self.rewards_humans = {agent.id: 0 for agent in self.human_agents}
-        self.travel_times_list = []
 
         if len(self.machine_agents) > 0:
             self._agent_selector = agent_selector(self.possible_agents)
@@ -480,6 +529,9 @@ class TrafficEnvironment(AECEnv):
         """
 
         self.simulator.stop()
+        for future in self.pending_futures:
+            future.result()
+        self.executor.shutdown(wait=True)
 
     def observe(self, agent: str) -> np.ndarray:
         """Retrieve the observations for a specific agent.
@@ -490,21 +542,32 @@ class TrafficEnvironment(AECEnv):
         Returns:
             self.observation_obj.agent_observations(agent) (np.ndarray): The observations for the specified agent.
         """
+        for machine in self.machine_agents:
+            if str(machine.id) == agent:
+                break
 
-        return self.observation_obj.agent_observations(agent)
+        # If the agent's turn hasn't come and the start time is bigger than the simulator timestep return an "empty observation"
+        # The agent hasn't acted yet so only the start time is meaningful
+        if agent != self.agent_selection and machine.start_time > self.simulator.timestep:
+            array = np.zeros(self._observation_spaces[agent].shape[0] - 1)
+            observation = np.concatenate((np.array([machine.start_time]), array))
+            return observation
+        
+        return self.observation_obj.agent_observations(agent, self.all_agents, self.agent_selection)
 
     #########################
     ### Mutation function ###
     #########################
 
-    def mutation(self, disable_human_learning: bool = True) -> None:
+    def mutation(self, disable_human_learning: bool = True, mutation_start_percentile: int = 25) -> None:
         """Perform mutation by converting selected human agents into machine agents.
 
         This method identifies a subset of human agents that start after the 25th percentile of start times of
         other vehicles, removes a specified number of these agents, and replaces them with machine agents.
 
         Args:
-            disable_human_learning (bool, optional): Boolean flag to disable human agents.
+            disable_human_learning (bool, default=True): Boolean flag to disable human agents.
+            mutation_start_percentile (int, default=25): The percentile threshold for selecting human agents for mutation. Set to -1 to disable this filter.
             
         Returns:
             None
@@ -516,15 +579,14 @@ class TrafficEnvironment(AECEnv):
         logging.info("Mutation is about to happen!\n")
         logging.info("There were %s human agents.\n", len(self.human_agents))
 
-        # Mutate to a human that starts after the 25% of the rest of the vehicles
-        #start_times = [human.start_time for human in self.human_agents]
-        #percentile_25 = np.percentile(start_times, 25)
-
-        #filtered_human_agents = [human for human in self.human_agents if human.start_time > percentile_25]
-        filtered_human_agents = [human for human in self.human_agents]
+        if mutation_start_percentile == -1:
+            filtered_human_agents = self.human_agents.copy()
+        else:
+            start_times = [human.start_time for human in self.human_agents]
+            percentile = np.percentile(start_times, mutation_start_percentile)
+            filtered_human_agents = [human for human in self.human_agents if human.start_time > percentile]
 
         number_of_machines_to_be_added = self.agent_params[kc.NEW_MACHINES_AFTER_MUTATION]
-        random_humans_deleted = []
 
         if len(filtered_human_agents) < number_of_machines_to_be_added:
             raise ValueError(
@@ -539,7 +601,6 @@ class TrafficEnvironment(AECEnv):
             self.human_agents.remove(random_human)
             filtered_human_agents.remove(random_human)
 
-            random_humans_deleted.append(random_human)
             self.machine_agents.append(MachineAgent(random_human.id,
                                                     random_human.start_time,
                                                     random_human.origin,
@@ -583,16 +644,37 @@ class TrafficEnvironment(AECEnv):
                            kc.AGENT_START_TIME: agent.start_time}
             self.simulator.add_vehicle(action_dict)
             self.episode_actions[agent.id] = action_dict
-        timestep, arrivals = self.simulator.step()
+        timestep, stopped_vehicles_info, arrivals, teleported = self.simulator.step()
+
+        if self.save_detectors_info == True:
+            self._save_detectors_info(stopped_vehicles_info)
 
         travel_times = dict()
         for veh_id in arrivals:
+            if veh_id not in teleported:
+                agent_id = int(veh_id)
+                travel_times[agent_id] = ({kc.TRAVEL_TIME:
+                                            (timestep - self.episode_actions[agent_id][kc.AGENT_START_TIME]) / 60.0})
+                travel_times[agent_id].update(self.episode_actions[agent_id])
+            
+        for veh_id in teleported:
             agent_id = int(veh_id)
-            travel_times[agent_id] = ({kc.TRAVEL_TIME:
-                                           (timestep - self.episode_actions[agent_id][kc.AGENT_START_TIME]) / 60.0})
+            travel_times[agent_id] = ({kc.TRAVEL_TIME: self.simulator.simulation_length / 60.0})
             travel_times[agent_id].update(self.episode_actions[agent_id])
 
         return travel_times.values()
+    
+    def _save_detectors_info(self, stopped_vehicles_info):
+        folder = self.plotter_params[kc.RECORDS_FOLDER] + '/' + kc.DETECTOR_STOPPED_VEHICLES
+        os.makedirs(folder, exist_ok=True)
+
+        if (self.simulator.timestep == 1):
+             [os.remove(f) for f in glob.glob(f"{folder}/*.csv")]
+
+        csv_file_path = f"{folder}/stopped_vehicles{self.simulator.timestep - 1}.csv"
+
+        df = pd.DataFrame(stopped_vehicles_info, columns=["time", "detector", "vehicle_id"])
+        df.to_csv(csv_file_path, index=False)
 
     def _reset_episode(self) -> None:
 
@@ -602,11 +684,14 @@ class TrafficEnvironment(AECEnv):
             self._agent_selector = agent_selector(self.possible_agents)
             self.agent_selection = self._agent_selector.next()
 
-        recording_task = threading.Thread(target=self._record, args=(self.day,
-                                                                     self.travel_times_list,
-                                                                     self.all_agents,
-                                                                     detectors_dict))
-        recording_task.start()
+        if self.day % self.save_every == 0:
+            dc_episode, dc_ep_observations, dc_agents, dc_detectors = dc(self.day), dc(self.travel_times_list), dc(self.all_agents), dc(detectors_dict)
+            recording_task = self.executor.submit(self._record, dc_episode, dc_ep_observations, dc_agents, dc_detectors)
+            self.pending_futures.append(recording_task)
+        
+        # Reset observations
+        if len(self.machine_agents) > 0:
+            self.observations = self.observation_obj.reset_observation()
 
         self.travel_times_list = []
         self.episode_actions = dict()
@@ -614,7 +699,10 @@ class TrafficEnvironment(AECEnv):
     def _assign_rewards(self) -> None:
 
         for agent in self.all_agents:
-            reward = agent.get_reward(self.travel_times_list)
+            if agent.kind == 'Human':
+                reward = agent.get_reward(self.travel_times_list)
+            else:
+                reward = agent.get_reward(self.travel_times_list, group_vicinity=self.agent_params[kc.MACHINE_PARAMETERS][kc.GROUP_VICINITY])
 
             # Add the reward in the travel_times_list
             for agent_entry in self.travel_times_list:
@@ -734,19 +822,15 @@ class TrafficEnvironment(AECEnv):
     ############################
 
     def _record(self, episode: int, ep_observations: dict, agents: list, detectors_dict: dict) -> None:
-
-        dc_episode, dc_ep_observations, dc_agents, dc_detectors = dc(episode), dc(ep_observations), dc(agents), dc(detectors_dict)
         zero_space = [0] * self.action_space_size
-
         cost_tables = [
             {
                 kc.AGENT_ID: agent.id,
                 kc.COST_TABLE: getattr(agent.model, 'cost', zero_space) if hasattr(agent, 'model') else zero_space
             }
-            for agent in dc_agents
+            for agent in agents
         ]
-
-        self.recorder.record(dc_episode, dc_ep_observations, cost_tables, dc_detectors)
+        self.recorder.record(episode, ep_observations, cost_tables, detectors_dict)
 
     def plot_results(self) -> None:
         """Method that plot the results of the simulation.
@@ -813,5 +897,15 @@ class TrafficEnvironment(AECEnv):
                                       self.human_agents,
                                       self.simulation_params,
                                       self.agent_params)
+        elif observation_type == kc.PREVIOUS_AGENTS_PLUS_START_TIME_DETECTOR_DATA:
+            if self.save_detectors_info == False:
+                raise Exception("Detector info saving is disabled. Please set 'self.save_detectors_info = True' to proceed or change the observation type.")
+            
+            return PreviousAgentStartPlusStartTimeDetectorData(self.machine_agents,
+                                      self.human_agents,
+                                      self.simulation_params,
+                                      self.plotter_params,
+                                      self.agent_params,
+                                      self.simulator)
         else:
             raise ValueError('[MODEL INVALID] Unrecognized observation type: ' + observation_type)

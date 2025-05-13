@@ -37,6 +37,7 @@ class BaseAgent(ABC):
         self.destination = destination
         self.behavior = behavior
         self.last_action = 0
+        self.default_action = None
 
     @property
     @abstractmethod
@@ -135,6 +136,7 @@ class HumanAgent(BaseAgent):
         kind = kc.TYPE_HUMAN
         behavior = kc.SELFISH
         super().__init__(id, kind, start_time, origin, destination, behavior)
+        self.initial_knowledge = initial_knowledge
         self.model = get_learning_model(params, initial_knowledge)
         self.last_reward = None
 
@@ -171,7 +173,8 @@ class HumanAgent(BaseAgent):
         Returns:
             int: The action of the agent.
         """
-
+        if self.default_action is not None:
+            return self.default_action
         return self.model.act(observation)
 
     def learn(self, action, observation) -> None:
@@ -334,7 +337,7 @@ class MachineAgent(BaseAgent):
         warmth_agents = warmth_human + warmth_machine
         return warmth_agents
 
-    def get_reward(self, observation: list[dict]) -> float:
+    def get_reward(self, observation: list[dict], group_vicinity: bool = False) -> float:
         """This method calculated the reward of each individual agent, based on the travel time of the agent,
         the group of agents, the other agents, and all agents, weighted according to the agent's behavior.
 
@@ -344,14 +347,18 @@ class MachineAgent(BaseAgent):
         Returns:
             float: The reward of the agent.
         """
-
-        min_start_time, max_start_time = self.start_time - self.observed_span, self.start_time + self.observed_span
-        
         vicinity_obs = list()
-        for obs in observation:
-            if (obs[kc.AGENT_ORIGIN], obs[kc.AGENT_DESTINATION]) == (self.origin, self.destination):
-                if min_start_time <= obs[kc.AGENT_START_TIME] <= max_start_time:
-                    vicinity_obs.append(obs)
+        if group_vicinity == True:
+
+            min_start_time, max_start_time = self.start_time - self.observed_span, self.start_time + self.observed_span
+
+            for obs in observation:
+                if (obs[kc.AGENT_ORIGIN], obs[kc.AGENT_DESTINATION]) == (self.origin, self.destination):
+                    if min_start_time <= obs[kc.AGENT_START_TIME] <= max_start_time:
+                        vicinity_obs.append(obs)
+        else:        
+            for obs in observation:
+                vicinity_obs.append(obs)
 
         group_obs, others_obs, all_obs, own_tt = list(), list(), list(), None
         for obs in vicinity_obs:
@@ -379,6 +386,8 @@ class MachineAgent(BaseAgent):
             a, b, c, d = -2, 0, 1, 0
         elif self.behavior == kc.COLLABORATIVE:
             a, b, c, d = -0.5, -0.5, 0, 0
+        elif self.behavior == kc.COOPERATIVE:
+            a, b, c, d = 0, -1, 0, 0
         elif self.behavior == kc.SOCIAL:
             a, b, c, d = -0.5, 0, 0, -0.5
         elif self.behavior == kc.ALTRUISTIC:
