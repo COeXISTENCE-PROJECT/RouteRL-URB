@@ -1,5 +1,10 @@
 <img src="https://raw.githubusercontent.com/aonurakman/assets/refs/heads/main/icons/routerl_modern_cropped.png" align="right" width="20%"/>
 
+
+> [!IMPORTANT]
+> Thank you to all the contributors. This project has been archived and merged into [RouteRL](https://github.com/COeXISTENCE-PROJECT/RouteRL). Users can retain access via [`routerlurb` v1.3.0](https://pypi.org/project/routerlurb/), but it will not receive future updates. Please use the latest [`routerl`](https://pypi.org/project/routerl/) instead.
+
+ 
 # Welcome to the future of urban routing.
 
 Multi-Agent Reinforcement Learning framework for modeling and simulating the collective route choices of humans and autonomous vehicles.
